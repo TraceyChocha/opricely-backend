@@ -114,7 +114,7 @@ async def shopify_webhook(request: Request):
 
     try:
         # Use standard model tag supported by google.generativeai
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(
             prompt,
             generation_config={"response_mime_type": "application/json"}
