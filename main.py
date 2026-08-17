@@ -113,13 +113,17 @@ async def shopify_webhook(request: Request):
     """
 
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        # Use standard model tag supported by google.generativeai
+        model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(
             prompt,
             generation_config={"response_mime_type": "application/json"}
         )
         rec = json.loads(response.text)
     except Exception as e:
+        
+        # Print the exact error so it appears in your Render logs!
+        print(f"CRITICAL GEMINI ERROR: {type(e).__name__} - {str(e)}")
         raise HTTPException(status_code=500, detail=f"Gemini Execution Error: {str(e)}")
 
     proposed_price = float(rec.get("proposed_price", current_price))
