@@ -1,10 +1,12 @@
 import os
 import json
-import requests
+import asyncio
+import random
+import httpx
 from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client, Client
 
-app = FastAPI(title="Pricely AI Agent Backend")
+app = FastAPI(title="Opricely AI Agent Backend")
 
 # Environment Variables
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -15,12 +17,17 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
-def call_gemini_api(prompt: str) -> dict:
-    """Calls Gemini using direct REST API to eliminate SDK 404/v1beta version mismatches."""
+# In-memory queue lock: prevents concurrent Shopify webhooks from hitting Gemini at the exact same millisecond
+gemini_lock = asyncio.Lock()
+
+
+async def call_gemini_api(prompt: str) -> dict:
+    """Calls Gemini REST API asynchronously with a lock queue and jittered retry backoffs."""
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY is missing from environment variables.")
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
+    # Switched from 3.6-flash preview (capped at 20 RPD) to stable gemini-2.5-flash (1,500 RPD)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
     
     payload = {
@@ -28,14 +35,28 @@ def call_gemini_api(prompt: str) -> dict:
         "generationConfig": {"response_mime_type": "application/json"}
     }
 
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-    
-    if response.status_code != 200:
-        raise Exception(f"Gemini API returned HTTP {response.status_code}: {response.text}")
+    # Delays tailored to respect Google's required retry windows (~49s)
+    delays = [5, 15, 35]
 
-    res_json = response.json()
-    raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
-    return json.loads(raw_text)
+    async with gemini_lock:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for attempt, delay in enumerate(delays):
+                response = await client.post(url, headers=headers, json=payload)
+                
+                if response.status_code == 429:
+                    jittered_delay = delay + random.uniform(0.5, 2.0)
+                    print(f"Rate limit hit (429). Retry attempt {attempt + 1}/{len(delays)} waiting {jittered_delay:.2f}s...")
+                    await asyncio.sleep(jittered_delay)
+                    continue
+                    
+                if response.status_code != 200:
+                    raise Exception(f"Gemini API returned HTTP {response.status_code}: {response.text}")
+
+                res_json = response.json()
+                raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
+                return json.loads(raw_text)
+                
+        raise Exception("Gemini API rate limit exceeded after maximum retries.")
 
 
 def update_shopify_price(variant_id: str, new_price: float):
@@ -73,7 +94,7 @@ def update_shopify_price(variant_id: str, new_price: float):
         }
     }
 
-    response = requests.post(url, json={"query": mutation, "variables": variables}, headers=headers)
+    response = httpx.post(url, json={"query": mutation, "variables": variables}, headers=headers, timeout=10.0)
     res_data = response.json()
 
     user_errors = res_data.get("data", {}).get("productVariantUpdate", {}).get("userErrors", [])
@@ -87,7 +108,7 @@ def update_shopify_price(variant_id: str, new_price: float):
 
 @app.get("/")
 def read_root():
-    return {"status": "Pricely Backend Engine Running"}
+    return {"status": "Opricely Backend Engine Running"}
 
 
 @app.post("/webhooks/shopify")
@@ -129,7 +150,7 @@ async def shopify_webhook(request: Request):
     """
 
     try:
-        rec = call_gemini_api(prompt)
+        rec = await call_gemini_api(prompt)
     except Exception as e:
         print(f"CRITICAL GEMINI ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Gemini Execution Error: {str(e)}")
