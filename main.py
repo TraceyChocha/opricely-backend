@@ -1,6 +1,6 @@
 import os
 import json
-import time
+import asyncio
 import requests
 from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client, Client
@@ -16,7 +16,9 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
-def call_gemini_api(prompt: str) -> dict:
+
+async def call_gemini_api(prompt: str) -> dict:
+    """Calls Gemini REST API using non-blocking async pauses for rate limit backoffs."""
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY is missing from environment variables.")
 
@@ -34,7 +36,7 @@ def call_gemini_api(prompt: str) -> dict:
         
         if response.status_code == 429:
             print(f"Rate limit hit (429). Retry attempt {attempt + 1}/{len(delays)} waiting {delay}s...")
-            time.sleep(delay)  # <-- This exact line forces Python to pause
+            await asyncio.sleep(delay)  # Non-blocking pause for async event loop
             continue
             
         if response.status_code != 200:
@@ -100,7 +102,7 @@ def read_root():
 
 
 @app.post("/webhooks/shopify")
-def shopify_webhook(request: Request):
+async def shopify_webhook(request: Request):
     payload = await request.json()
     
     product_id = str(payload.get("id") or payload.get("product_id", ""))
@@ -138,7 +140,7 @@ def shopify_webhook(request: Request):
     """
 
     try:
-        rec = call_gemini_api(prompt)
+        rec = await call_gemini_api(prompt)
     except Exception as e:
         print(f"CRITICAL GEMINI ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Gemini Execution Error: {str(e)}")
