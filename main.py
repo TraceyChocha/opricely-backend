@@ -100,7 +100,7 @@ def read_root():
 
 
 @app.post("/webhooks/shopify")
-async def shopify_webhook(request: Request):
+def shopify_webhook(request: Request):
     payload = await request.json()
     
     product_id = str(payload.get("id") or payload.get("product_id", ""))
