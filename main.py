@@ -17,7 +17,6 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 def call_gemini_api(prompt: str) -> dict:
-    """Calls Gemini using direct REST API with automatic rate limit (429) retry logic."""
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY is missing from environment variables.")
 
@@ -29,15 +28,13 @@ def call_gemini_api(prompt: str) -> dict:
         "generationConfig": {"response_mime_type": "application/json"}
     }
 
-     # Exponential backoff parameters
-    delays = [2, 5, 10]  # Total 17s buffer across 3 attempts
+    delays = [2, 5, 10]
     for attempt, delay in enumerate(delays):
         response = requests.post(url, headers=headers, json=payload, timeout=30)
         
-        # If rate limited (HTTP 429), wait exponentially and retry
         if response.status_code == 429:
             print(f"Rate limit hit (429). Retry attempt {attempt + 1}/{len(delays)} waiting {delay}s...")
-            time.sleep(delay)
+            time.sleep(delay)  # <-- This exact line forces Python to pause
             continue
             
         if response.status_code != 200:
