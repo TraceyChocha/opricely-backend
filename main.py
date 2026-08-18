@@ -1,7 +1,7 @@
 import os
 import json
 import asyncio
-import requests
+import httpx
 from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client, Client
 
@@ -16,9 +16,7 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
-
 async def call_gemini_api(prompt: str) -> dict:
-    """Calls Gemini REST API using non-blocking async pauses for rate limit backoffs."""
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY is missing from environment variables.")
 
@@ -31,21 +29,24 @@ async def call_gemini_api(prompt: str) -> dict:
     }
 
     delays = [2, 5, 10]
-    for attempt, delay in enumerate(delays):
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        
-        if response.status_code == 429:
-            print(f"Rate limit hit (429). Retry attempt {attempt + 1}/{len(delays)} waiting {delay}s...")
-            await asyncio.sleep(delay)  # Non-blocking pause for async event loop
-            continue
+    
+    # Use httpx.AsyncClient for genuine non-blocking calls
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for attempt, delay in enumerate(delays):
+            response = await client.post(url, headers=headers, json=payload)
             
-        if response.status_code != 200:
-            raise Exception(f"Gemini API returned HTTP {response.status_code}: {response.text}")
+            if response.status_code == 429:
+                print(f"Rate limit hit (429). Retry attempt {attempt + 1}/{len(delays)} waiting {delay}s...")
+                await asyncio.sleep(delay)  # Truly pauses the loop for 2s, 5s, 10s
+                continue
+                
+            if response.status_code != 200:
+                raise Exception(f"Gemini API returned HTTP {response.status_code}: {response.text}")
 
-        res_json = response.json()
-        raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
-        return json.loads(raw_text)
-        
+            res_json = response.json()
+            raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
+            return json.loads(raw_text)
+            
     raise Exception("Gemini API rate limit exceeded after maximum retries.")
 
 
