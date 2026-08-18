@@ -29,7 +29,7 @@ def call_gemini_api(prompt: str) -> dict:
         "generationConfig": {"response_mime_type": "application/json"}
     }
 
-    response = requests.post(url, headers=headers, json=payload, timeout=15)
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
     
     if response.status_code != 200:
         raise Exception(f"Gemini API returned HTTP {response.status_code}: {response.text}")
