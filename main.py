@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client, Client
@@ -16,12 +17,11 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 def call_gemini_api(prompt: str) -> dict:
-    """Calls Gemini using direct REST API to eliminate SDK 404/v1beta version mismatches."""
+    """Calls Gemini using direct REST API with automatic rate limit (429) retry logic."""
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY is missing from environment variables.")
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
-
     headers = {"Content-Type": "application/json"}
     
     payload = {
@@ -29,14 +29,25 @@ def call_gemini_api(prompt: str) -> dict:
         "generationConfig": {"response_mime_type": "application/json"}
     }
 
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-    
-    if response.status_code != 200:
-        raise Exception(f"Gemini API returned HTTP {response.status_code}: {response.text}")
+    # Try up to 3 attempts with brief pauses for rate limits
+    max_retries = 3
+    for attempt in range(max_retries):
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        
+        # If rate limited (HTTP 429), wait 2 seconds and retry
+        if response.status_code == 429:
+            print(f"Rate limit hit (429). Retry attempt {attempt + 1}/{max_retries} in 2 seconds...")
+            time.sleep(2)
+            continue
+            
+        if response.status_code != 200:
+            raise Exception(f"Gemini API returned HTTP {response.status_code}: {response.text}")
 
-    res_json = response.json()
-    raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
-    return json.loads(raw_text)
+        res_json = response.json()
+        raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
+        return json.loads(raw_text)
+        
+    raise Exception("Gemini API rate limit exceeded after maximum retries.")
 
 
 def update_shopify_price(variant_id: str, new_price: float):
