@@ -3,7 +3,7 @@ import json
 import asyncio
 import random
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from supabase import create_client, Client
 
 app = FastAPI(title="Opricely AI Agent Backend")
@@ -17,17 +17,15 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
-# In-memory queue lock: prevents concurrent Shopify webhooks from hitting Gemini at the exact same millisecond
 gemini_lock = asyncio.Lock()
 
 
 async def call_gemini_api(prompt: str) -> dict:
-    """Calls Gemini REST API asynchronously with a lock queue and jittered retry backoffs."""
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY is missing from environment variables.")
 
-    # Switched from 3.6-flash preview (capped at 20 RPD) to stable gemini-2.5-flash (1,500 RPD)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    # Target the active 3.6-flash endpoint
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
     
     payload = {
@@ -35,8 +33,7 @@ async def call_gemini_api(prompt: str) -> dict:
         "generationConfig": {"response_mime_type": "application/json"}
     }
 
-    # Delays tailored to respect Google's required retry windows (~49s)
-    delays = [5, 15, 35]
+    delays = [5, 15, 30]
 
     async with gemini_lock:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -44,7 +41,7 @@ async def call_gemini_api(prompt: str) -> dict:
                 response = await client.post(url, headers=headers, json=payload)
                 
                 if response.status_code == 429:
-                    jittered_delay = delay + random.uniform(0.5, 2.0)
+                    jittered_delay = delay + random.uniform(1.0, 3.0)
                     print(f"Rate limit hit (429). Retry attempt {attempt + 1}/{len(delays)} waiting {jittered_delay:.2f}s...")
                     await asyncio.sleep(jittered_delay)
                     continue
@@ -60,7 +57,6 @@ async def call_gemini_api(prompt: str) -> dict:
 
 
 def update_shopify_price(variant_id: str, new_price: float):
-    """Executes a price mutation on Shopify using GraphQL."""
     if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ACCESS_TOKEN:
         print("Shopify credentials not configured. Skipping live price mutation.")
         return False
@@ -106,27 +102,8 @@ def update_shopify_price(variant_id: str, new_price: float):
     return True
 
 
-@app.get("/")
-def read_root():
-    return {"status": "Opricely Backend Engine Running"}
-
-
-@app.post("/webhooks/shopify")
-async def shopify_webhook(request: Request):
-    payload = await request.json()
-    
-    product_id = str(payload.get("id") or payload.get("product_id", ""))
-    title = payload.get("title", "Sample Product")
-    variants = payload.get("variants", [{}])
-    variant = variants[0] if variants else {}
-    variant_id = str(variant.get("id", product_id))
-    current_price = float(variant.get("price", 0.0) or 10.0)
-    cost_price = float(variant.get("cost", 0.0) or (current_price * 0.5))
-    inventory_quantity = int(variant.get("inventory_quantity", 15))
-
-    if not product_id:
-        raise HTTPException(status_code=400, detail="Invalid product ID")
-
+async def process_pricing_task(product_id: str, title: str, variant_id: str, current_price: float, cost_price: float, inventory_quantity: int):
+    """Processes the Gemini evaluation safely in the background."""
     min_margin = 0.20
     max_increase = 0.15
 
@@ -151,47 +128,70 @@ async def shopify_webhook(request: Request):
 
     try:
         rec = await call_gemini_api(prompt)
+        proposed_price = float(rec.get("proposed_price", current_price))
+        should_change = bool(rec.get("should_change_price", False))
+        reasoning = str(rec.get("reasoning", ""))
+
+        min_allowable = round(cost_price * (1 + min_margin), 2)
+        max_allowable = round(current_price * (1 + max_increase), 2)
+
+        if proposed_price < min_allowable:
+            proposed_price = min_allowable
+        elif proposed_price > max_allowable:
+            proposed_price = max_allowable
+
+        mutation_executed = False
+
+        if should_change and proposed_price != current_price:
+            mutation_executed = update_shopify_price(variant_id, proposed_price)
+
+        if supabase and should_change:
+            try:
+                supabase.table("pricing_logs").insert({
+                    "product_id": product_id,
+                    "product_title": title,
+                    "old_price": current_price,
+                    "proposed_price": proposed_price,
+                    "ai_reasoning": reasoning,
+                    "status": "applied" if mutation_executed else "pending"
+                }).execute()
+            except Exception as log_err:
+                print(f"Supabase Log Warning: {log_err}")
+
     except Exception as e:
-        print(f"CRITICAL GEMINI ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Gemini Execution Error: {str(e)}")
+        print(f"BACKGROUND PROCESS ERROR: {str(e)}")
 
-    proposed_price = float(rec.get("proposed_price", current_price))
-    should_change = bool(rec.get("should_change_price", False))
-    reasoning = str(rec.get("reasoning", ""))
 
-    # Guardrail checks
-    min_allowable = round(cost_price * (1 + min_margin), 2)
-    max_allowable = round(current_price * (1 + max_increase), 2)
+@app.get("/")
+def read_root():
+    return {"status": "Opricely Backend Engine Running"}
 
-    if proposed_price < min_allowable:
-        proposed_price = min_allowable
-    elif proposed_price > max_allowable:
-        proposed_price = max_allowable
 
-    mutation_executed = False
+@app.post("/webhooks/shopify")
+async def shopify_webhook(request: Request, background_tasks: BackgroundTasks):
+    payload = await request.json()
+    
+    product_id = str(payload.get("id") or payload.get("product_id", ""))
+    title = payload.get("title", "Sample Product")
+    variants = payload.get("variants", [{}])
+    variant = variants[0] if variants else {}
+    variant_id = str(variant.get("id", product_id))
+    current_price = float(variant.get("price", 0.0) or 10.0)
+    cost_price = float(variant.get("cost", 0.0) or (current_price * 0.5))
+    inventory_quantity = int(variant.get("inventory_quantity", 15))
 
-    if should_change and proposed_price != current_price:
-        mutation_executed = update_shopify_price(variant_id, proposed_price)
+    if not product_id:
+        raise HTTPException(status_code=400, detail="Invalid product ID")
 
-    if supabase and should_change:
-        try:
-            supabase.table("pricing_logs").insert({
-                "product_id": product_id,
-                "product_title": title,
-                "old_price": current_price,
-                "proposed_price": proposed_price,
-                "ai_reasoning": reasoning,
-                "status": "applied" if mutation_executed else "pending"
-            }).execute()
-        except Exception as log_err:
-            print(f"Supabase Log Warning: {log_err}")
+    # Queue the evaluation task in the background and respond immediately to Shopify
+    background_tasks.add_task(
+        process_pricing_task,
+        product_id,
+        title,
+        variant_id,
+        current_price,
+        cost_price,
+        inventory_quantity
+    )
 
-    return {
-        "status": "success",
-        "title": title,
-        "current_price": current_price,
-        "recommended_price": proposed_price,
-        "should_change": should_change,
-        "price_updated_in_shopify": mutation_executed,
-        "ai_reasoning": reasoning
-    }
+    return {"status": "queued", "message": "Webhook received successfully."}
