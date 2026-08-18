@@ -4,3 +4,4 @@ supabase
 requests
 google-genai
 pydantic
+httpx
