@@ -3,7 +3,6 @@ import json
 import requests
 from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client, Client
-import google.generativeai as genai
 
 app = FastAPI(title="Opricely AI Agent Backend")
 
@@ -14,10 +13,30 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
+def call_gemini_api(prompt: str) -> dict:
+    """Calls Gemini using direct REST API to eliminate SDK 404/v1beta version mismatches."""
+    if not GEMINI_API_KEY:
+        raise Exception("GEMINI_API_KEY is missing from environment variables.")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"response_mime_type": "application/json"}
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=15)
+    
+    if response.status_code != 200:
+        raise Exception(f"Gemini API returned HTTP {response.status_code}: {response.text}")
+
+    res_json = response.json()
+    raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
+    return json.loads(raw_text)
+
 
 def update_shopify_price(variant_id: str, new_price: float):
     """Executes a price mutation on Shopify using GraphQL."""
@@ -25,9 +44,7 @@ def update_shopify_price(variant_id: str, new_price: float):
         print("Shopify credentials not configured. Skipping live price mutation.")
         return False
 
-    # Standardize GraphQL GID format
     formatted_gid = variant_id if variant_id.startswith("gid://") else f"gid://shopify/ProductVariant/{variant_id}"
-
     url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2026-01/graphql.json"
     headers = {
         "Content-Type": "application/json",
@@ -89,7 +106,6 @@ async def shopify_webhook(request: Request):
     if not product_id:
         raise HTTPException(status_code=400, detail="Invalid product ID")
 
-    # Safety Limits
     min_margin = 0.20
     max_increase = 0.15
 
@@ -113,24 +129,16 @@ async def shopify_webhook(request: Request):
     """
 
     try:
-        # Use standard model tag supported by google.generativeai
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        response = model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json"}
-        )
-        rec = json.loads(response.text)
+        rec = call_gemini_api(prompt)
     except Exception as e:
-        
-        # Print the exact error so it appears in your Render logs!
-        print(f"CRITICAL GEMINI ERROR: {type(e).__name__} - {str(e)}")
+        print(f"CRITICAL GEMINI ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Gemini Execution Error: {str(e)}")
 
     proposed_price = float(rec.get("proposed_price", current_price))
     should_change = bool(rec.get("should_change_price", False))
     reasoning = str(rec.get("reasoning", ""))
 
-    # Guardrails Enforcement
+    # Guardrail checks
     min_allowable = round(cost_price * (1 + min_margin), 2)
     max_allowable = round(current_price * (1 + max_increase), 2)
 
@@ -141,11 +149,9 @@ async def shopify_webhook(request: Request):
 
     mutation_executed = False
 
-    # Auto-Apply price change to Shopify if recommended
     if should_change and proposed_price != current_price:
         mutation_executed = update_shopify_price(variant_id, proposed_price)
 
-    # Log action to Supabase
     if supabase and should_change:
         try:
             supabase.table("pricing_logs").insert({
