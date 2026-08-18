@@ -29,15 +29,15 @@ def call_gemini_api(prompt: str) -> dict:
         "generationConfig": {"response_mime_type": "application/json"}
     }
 
-    # Try up to 3 attempts with brief pauses for rate limits
-    max_retries = 3
-    for attempt in range(max_retries):
+     # Exponential backoff parameters
+    delays = [2, 5, 10]  # Total 17s buffer across 3 attempts
+    for attempt, delay in enumerate(delays):
         response = requests.post(url, headers=headers, json=payload, timeout=30)
         
-        # If rate limited (HTTP 429), wait 2 seconds and retry
+        # If rate limited (HTTP 429), wait exponentially and retry
         if response.status_code == 429:
-            print(f"Rate limit hit (429). Retry attempt {attempt + 1}/{max_retries} in 2 seconds...")
-            time.sleep(2)
+            print(f"Rate limit hit (429). Retry attempt {attempt + 1}/{len(delays)} waiting {delay}s...")
+            time.sleep(delay)
             continue
             
         if response.status_code != 200:
