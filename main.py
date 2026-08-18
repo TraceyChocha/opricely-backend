@@ -1,11 +1,10 @@
 import os
 import json
-import asyncio
-import httpx
+import requests
 from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client, Client
 
-app = FastAPI(title="Opricely AI Agent Backend")
+app = FastAPI(title="Pricely AI Agent Backend")
 
 # Environment Variables
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -16,7 +15,8 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
-async def call_gemini_api(prompt: str) -> dict:
+def call_gemini_api(prompt: str) -> dict:
+    """Calls Gemini using direct REST API to eliminate SDK 404/v1beta version mismatches."""
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY is missing from environment variables.")
 
@@ -28,26 +28,14 @@ async def call_gemini_api(prompt: str) -> dict:
         "generationConfig": {"response_mime_type": "application/json"}
     }
 
-    delays = [2, 5, 10]
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
     
-    # Use httpx.AsyncClient for genuine non-blocking calls
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for attempt, delay in enumerate(delays):
-            response = await client.post(url, headers=headers, json=payload)
-            
-            if response.status_code == 429:
-                print(f"Rate limit hit (429). Retry attempt {attempt + 1}/{len(delays)} waiting {delay}s...")
-                await asyncio.sleep(delay)  # Truly pauses the loop for 2s, 5s, 10s
-                continue
-                
-            if response.status_code != 200:
-                raise Exception(f"Gemini API returned HTTP {response.status_code}: {response.text}")
+    if response.status_code != 200:
+        raise Exception(f"Gemini API returned HTTP {response.status_code}: {response.text}")
 
-            res_json = response.json()
-            raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
-            return json.loads(raw_text)
-            
-    raise Exception("Gemini API rate limit exceeded after maximum retries.")
+    res_json = response.json()
+    raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
+    return json.loads(raw_text)
 
 
 def update_shopify_price(variant_id: str, new_price: float):
@@ -99,7 +87,7 @@ def update_shopify_price(variant_id: str, new_price: float):
 
 @app.get("/")
 def read_root():
-    return {"status": "Opricely Backend Engine Running"}
+    return {"status": "Pricely Backend Engine Running"}
 
 
 @app.post("/webhooks/shopify")
@@ -141,7 +129,7 @@ async def shopify_webhook(request: Request):
     """
 
     try:
-        rec = await call_gemini_api(prompt)
+        rec = call_gemini_api(prompt)
     except Exception as e:
         print(f"CRITICAL GEMINI ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Gemini Execution Error: {str(e)}")
